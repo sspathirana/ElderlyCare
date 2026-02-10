@@ -44,17 +44,138 @@ fb = framebuf.FrameBuffer(buffer, oled_width, oled_height, framebuf.MONO_HLSB)
 # ADKeyboard setup
 adkey_pin = ADC(Pin(27))  # GPIO 27 for ADKeyboard
 ADKEY_VALUES = {
-    400: 'RIGHT',      # 0-1000
-    9600: 'DOWN',    # 9400-9600
-    21600: 'UP',     # 21300-21500
-    33500: 'LEFT',   # 32600-32800
-    48500: 'SELECT', # 47700-47900
+    0: 'RIGHT',      # 0-1000
+    9500: 'DOWN',    # 9400-9600
+    21400: 'UP',     # 21300-21500
+    32700: 'LEFT',   # 32600-32800
+    47900: 'SELECT', # 47700-47900
     65000: 'NONE'    # No press (high value)
 }
 
 # GPS UART setup
 gps_uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1))
 gps_parser = None
+
+# BMP280 Pressure Sensor Class
+class BMP280:
+    def __init__(self, i2c, addr=0x76):
+        self.i2c = i2c
+        self.addr = addr
+        self.dig_T1 = 0
+        self.dig_T2 = 0
+        self.dig_T3 = 0
+        self.dig_P1 = 0
+        self.dig_P2 = 0
+        self.dig_P3 = 0
+        self.dig_P4 = 0
+        self.dig_P5 = 0
+        self.dig_P6 = 0
+        self.dig_P7 = 0
+        self.dig_P8 = 0
+        self.dig_P9 = 0
+        self.t_fine = 0
+        self._read_calibration()
+        self._configure()
+        
+    def _read_calibration(self):
+        try:
+            # Read temperature calibration
+            cal1 = self.i2c.readfrom_mem(self.addr, 0x88, 24)
+            self.dig_T1 = (cal1[1] << 8) | cal1[0]
+            self.dig_T2 = (cal1[3] << 8) | cal1[2]
+            if self.dig_T2 > 32767:
+                self.dig_T2 -= 65536
+            self.dig_T3 = (cal1[5] << 8) | cal1[4]
+            if self.dig_T3 > 32767:
+                self.dig_T3 -= 65536
+                
+            # Read pressure calibration
+            self.dig_P1 = (cal1[7] << 8) | cal1[6]
+            self.dig_P2 = (cal1[9] << 8) | cal1[8]
+            if self.dig_P2 > 32767:
+                self.dig_P2 -= 65536
+            self.dig_P3 = (cal1[11] << 8) | cal1[10]
+            if self.dig_P3 > 32767:
+                self.dig_P3 -= 65536
+            self.dig_P4 = (cal1[13] << 8) | cal1[12]
+            if self.dig_P4 > 32767:
+                self.dig_P4 -= 65536
+            self.dig_P5 = (cal1[15] << 8) | cal1[14]
+            if self.dig_P5 > 32767:
+                self.dig_P5 -= 65536
+            self.dig_P6 = (cal1[17] << 8) | cal1[16]
+            if self.dig_P6 > 32767:
+                self.dig_P6 -= 65536
+            self.dig_P7 = (cal1[19] << 8) | cal1[18]
+            if self.dig_P7 > 32767:
+                self.dig_P7 -= 65536
+            self.dig_P8 = (cal1[21] << 8) | cal1[20]
+            if self.dig_P8 > 32767:
+                self.dig_P8 -= 65536
+            self.dig_P9 = (cal1[23] << 8) | cal1[22]
+            if self.dig_P9 > 32767:
+                self.dig_P9 -= 65536
+            return True
+        except:
+            return False
+    
+    def _configure(self):
+        # Configure BMP280
+        # osrs_t x1, osrs_p x4, normal mode
+        config = (0x01 << 5) | (0x03 << 2) | 0x03
+        self.i2c.writeto_mem(self.addr, 0xF4, bytes([config]))
+        # Set standby time to 1000ms
+        self.i2c.writeto_mem(self.addr, 0xF5, bytes([0xA0]))
+        
+    def _read_raw(self):
+        try:
+            data = self.i2c.readfrom_mem(self.addr, 0xF7, 6)
+            pres_raw = (data[0] << 12) | (data[1] << 4) | (data[2] >> 4)
+            temp_raw = (data[3] << 12) | (data[4] << 4) | (data[5] >> 4)
+            return temp_raw, pres_raw
+        except:
+            return 0, 0
+    
+    def _compensate_temperature(self, raw_temp):
+        var1 = ((raw_temp / 16384.0) - (self.dig_T1 / 1024.0)) * self.dig_T2
+        var2 = ((raw_temp / 131072.0) - (self.dig_T1 / 8192.0)) * ((raw_temp / 131072.0) - (self.dig_T1 / 8192.0)) * self.dig_T3
+        self.t_fine = var1 + var2
+        temperature = self.t_fine / 5120.0
+        return temperature
+    
+    def _compensate_pressure(self, raw_pressure):
+        var1 = (self.t_fine / 2.0) - 64000.0
+        var2 = var1 * var1 * self.dig_P6 / 32768.0
+        var2 = var2 + var1 * self.dig_P5 * 2.0
+        var2 = (var2 / 4.0) + (self.dig_P4 * 65536.0)
+        var1 = (self.dig_P3 * var1 * var1 / 524288.0 + self.dig_P2 * var1) / 524288.0
+        var1 = (1.0 + var1 / 32768.0) * self.dig_P1
+        pressure = 1048576.0 - raw_pressure
+        pressure = (pressure - (var2 / 4096.0)) * 6250.0 / var1
+        var1 = self.dig_P9 * pressure * pressure / 2147483648.0
+        var2 = pressure * self.dig_P8 / 32768.0
+        pressure = pressure + (var1 + var2 + self.dig_P7) / 16.0
+        return pressure / 100.0  # Convert to hPa
+    
+    def read_temperature(self):
+        temp_raw, pres_raw = self._read_raw()
+        if temp_raw == 0:
+            return None
+        return self._compensate_temperature(temp_raw)
+    
+    def read_pressure(self):
+        temp_raw, pres_raw = self._read_raw()
+        if temp_raw == 0 or pres_raw == 0:
+            return None
+        self._compensate_temperature(temp_raw)  # Update t_fine
+        return self._compensate_pressure(pres_raw)
+    
+    def read_altitude(self, sea_level_pressure=1013.25):
+        pressure = self.read_pressure()
+        if pressure is None:
+            return None
+        altitude = 44330.0 * (1.0 - pow(pressure / sea_level_pressure, 0.1903))
+        return altitude
 
 # MLX90614 Temperature Sensor Class
 class MLX90614:
@@ -271,7 +392,7 @@ class ADKeyboard:
         raw_value = self.adc.read_u16()
         current_time = ticks_ms()
         detected_key = 'NONE'
-#         print(adc_val)
+        
         # Find which key is pressed based on closest value
         for adc_val, key in self.values:
             if abs(raw_value - adc_val) <= self.threshold:
@@ -282,7 +403,6 @@ class ADKeyboard:
         if detected_key != 'NONE' and detected_key != self.last_key:
             # New key pressed
             if ticks_diff(current_time, self.last_press_time) > self.debounce_time:
-                print(raw_value)
                 self.last_key = detected_key
                 self.last_press_time = current_time
                 return detected_key
@@ -296,13 +416,14 @@ class ADKeyboard:
     def handle_navigation(self):
         global InitiateMeasurement, DataCollector, ReturnController
         key = self.read_key()
+        
         if self.screen_manager == 0:  # In menu mode
             if key == 'UP':
-                self.current_option = (self.current_option - 2) % 5 + 1
+                self.current_option = (self.current_option - 2) % 6 + 1
                 ScreenManager.Menu(self.current_option)
                 return True
             elif key == 'DOWN':
-                self.current_option = (self.current_option % 5) + 1
+                self.current_option = (self.current_option % 6) + 1
                 ScreenManager.Menu(self.current_option)
                 return True
             elif key == 'SELECT':
@@ -346,6 +467,11 @@ class ADKeyboard:
                 self.screen_manager = 0
                 ReturnController = True
                 return True
+        elif self.screen_manager == 6:  # ENVIRONMENT mode
+            if key == 'LEFT':  # Use LEFT as back button
+                self.screen_manager = 0
+                ReturnController = True
+                return True
         elif self.screen_manager >= 20:  # In analysis result screens
             if key == 'SELECT' or key == 'LEFT':  # Go back to menu
                 self.screen_manager = 0
@@ -377,7 +503,15 @@ def connect_mqtt():
 # Initialize sensor objects
 mlx_sensor = None
 mpu_sensor = None
+bmp_sensor = None
 gps_parser = GPSParser()
+
+try:
+    # Try to initialize BMP280
+    bmp_sensor = BMP280(i2c_sensors)
+    print("BMP280 initialized")
+except Exception as e:
+    print(f"BMP280 not found: {e}")
 
 try:
     # Try to initialize MLX90614
@@ -434,7 +568,8 @@ class ScreenManager:
             ('2.HRV ANALYSIS', 25),
             ('3.KUBIOS', 40),
             ('4.SENSORS', 55),
-            ('5.GPS', 70)
+            ('5.GPS', 70),
+            ('6.ENVIRONMENT', 85)
         ]
         
         # Display menu options with checkboxes for selection
@@ -456,6 +591,8 @@ class ScreenManager:
             oled.text('VIEW SENSORS', 0, 20)
         elif selected_option == 5:
             oled.text('VIEW GPS', 0, 20)
+        elif selected_option == 6:
+            oled.text('VIEW ENV DATA', 0, 20)
         oled.text('PRESS LEFT TO', 0, 35)
         oled.text('GO BACK', 0, 50)
         oled.show()
@@ -522,6 +659,46 @@ class ScreenManager:
         
         oled.text('Scanning...', 20, 110)
         oled.show()
+    
+    @staticmethod
+    def ShowEnvironment():
+        oled.fill(0)
+        oled.text('ENV DATA', 40, 5)
+        
+        row = 20
+        
+        # Show BMP280 data if available
+        if bmp_sensor:
+            try:
+                temp = bmp_sensor.read_temperature()
+                pressure = bmp_sensor.read_pressure()
+                altitude = bmp_sensor.read_altitude()
+                
+                if temp is not None:
+                    oled.text(f'Temp: {temp:.1f}C', 0, row)
+                    row += 12
+                
+                if pressure is not None:
+                    oled.text(f'Press: {pressure:.1f}hPa', 0, row)
+                    row += 12
+                
+                if altitude is not None:
+                    oled.text(f'Alt: {altitude:.1f}m', 0, row)
+                    row += 12
+            except Exception as e:
+                oled.text('BMP Error', 0, row)
+                row += 12
+        else:
+            oled.text('No BMP280', 0, row)
+            row += 12
+        
+        # Show MLX90614 ambient temp for comparison
+        if mlx_sensor:
+            amb_temp = mlx_sensor.read_ambient_temp()
+            if amb_temp:
+                oled.text(f'IR Temp: {amb_temp:.1f}C', 0, row)
+        
+        oled.show()
 
 # class MeasurementProcessor to execute MQTT and KUBIOS
 class MeasurementProcessor:
@@ -586,6 +763,22 @@ class MeasurementProcessor:
                 }
             except:
                 pass  # Skip motion data if there's an error
+        
+        # Add environmental data if available
+        if bmp_sensor:
+            try:
+                bmp_temp = bmp_sensor.read_temperature()
+                pressure = bmp_sensor.read_pressure()
+                altitude = bmp_sensor.read_altitude()
+                
+                if bmp_temp is not None:
+                    measurement["bmp_temperature"] = round(bmp_temp, 1)
+                if pressure is not None:
+                    measurement["pressure"] = round(pressure, 1)
+                if altitude is not None:
+                    measurement["bmp_altitude"] = round(altitude, 1)
+            except:
+                pass  # Skip environmental data if there's an error
 
         # Convert data to JSON string
         json_message = ujson.dumps(measurement)
@@ -825,10 +1018,13 @@ while True:
             elif adkey.current_option == 3: # KUBIOS
                 MeasurementProcessor.CloudAnalysis()
     
-    # Handle sensor and GPS screens
+    # Handle sensor, GPS, and environment screens
     elif adkey.screen_manager == 4:  # Sensors screen
         ScreenManager.ShowSensors()
         sleep(0.5)  # Update every 0.5 seconds
     elif adkey.screen_manager == 5:  # GPS screen
         ScreenManager.ShowGPS()
+        sleep(1)  # Update every second
+    elif adkey.screen_manager == 6:  # Environment screen
+        ScreenManager.ShowEnvironment()
         sleep(1)  # Update every second
